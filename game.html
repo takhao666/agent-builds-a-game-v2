@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Snake — one prompt, one agent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #050510; overflow: hidden; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    color: #e8f6ff; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 10px;
+  }
+  #wrap { position: relative; width: min(96vw, 960px); }
+  canvas {
+    display: block; width: 100%; border-radius: 14px;
+    background: #070718;
+    box-shadow: 0 0 0 2px #1c2b4a, 0 0 42px rgba(0, 229, 255, .28), 0 0 90px rgba(255, 0, 170, .14);
+  }
+  #hud {
+    display: flex; justify-content: space-between; align-items: center;
+    width: 100%; padding: 2px 6px; font-weight: 700; letter-spacing: .06em;
+    font-size: clamp(15px, 2.4vw, 21px); text-transform: uppercase;
+  }
+  #hud .score { color: #00e5ff; text-shadow: 0 0 12px rgba(0,229,255,.8); }
+  #hud .best { color: #ff9de2; }
+  #hud .lives { color: #ffe14d; letter-spacing: .18em; }
+  #overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    gap: 14px; background: rgba(4, 4, 18, .72); border-radius: 14px;
+    backdrop-filter: blur(2px); padding: 20px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 {
+    font-size: clamp(34px, 6vw, 64px); line-height: 1.02; letter-spacing: .04em;
+    background: linear-gradient(90deg, #00e5ff, #7c5cff, #ff00aa);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    text-shadow: 0 0 34px rgba(0, 229, 255, .25);
+  }
+  #overlay p { font-size: clamp(15px, 2.4vw, 21px); color: #b9d6ea; max-width: 560px; line-height: 1.5; }
+  #overlay .keys { font-size: clamp(13px, 2vw, 17px); color: #8fb4cc; }
+  #overlay .big { font-size: clamp(22px, 3.6vw, 32px); font-weight: 800; color: #ffe14d; }
+  #overlay button {
+    font: inherit; font-weight: 800; letter-spacing: .08em; cursor: pointer;
+    color: #081018; background: linear-gradient(90deg, #00e5ff, #7cffb2);
+    border: 0; border-radius: 999px; padding: 14px 34px; font-size: clamp(16px, 2.4vw, 20px);
+    box-shadow: 0 0 26px rgba(0, 229, 255, .55);
+  }
+  #overlay button:hover { filter: brightness(1.12); }
+  #hint { font-size: 13px; color: #5f7d95; letter-spacing: .05em; }
+  #hint b { color: #9fc6dd; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="hud">
+      <span class="score">Score <span id="score">0</span></span>
+      <span class="best">Best <span id="best">0</span></span>
+      <span class="lives" id="lives">♥♥♥</span>
+    </div>
+    <canvas id="game" width="960" height="640"></canvas>
+    <div id="overlay">
+      <h1 id="ovTitle">NEON SNAKE</h1>
+      <p id="ovText">Eat the glowing orbs. Grow long, go fast, don't bite yourself or the walls.</p>
+      <p class="keys">← ↑ ↓ → or WASD to steer &nbsp;·&nbsp; swipe on touch &nbsp;·&nbsp; P pause &nbsp;·&nbsp; R restart</p>
+      <button id="ovBtn">▶&nbsp; START</button>
+    </div>
+  </div>
+  <div id="hint">Built from one prompt by an AI agent · open <b>game.html</b> and play · <b>?demo=1</b> watches it play itself</div>
+
+<script>
+(() => {
+  'use strict';
+  const COLS = 30, ROWS = 20, CELL = 32;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const ovTitle = document.getElementById('ovTitle');
+  const ovText = document.getElementById('ovText');
+  const ovBtn = document.getElementById('ovBtn');
+  const scoreEl = document.getElementById('score');
+  const bestEl = document.getElementById('best');
+  const livesEl = document.getElementById('lives');
+
+  const params = new URLSearchParams(location.search);
+  const DEMO = params.get('demo') === '1';
+
+  // Small seeded RNG so demo mode plays the same run every time.
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return () => {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rand = DEMO ? mulberry32(20261123) : Math.random;
+
+  let snake, dir, nextDir, orbs, score, best, lives, level, speedMs, lastTick, acc;
+  let state = 'menu'; // menu | playing | paused | over
+  let flash = 0, eatenAt = 0, particles = [];
+
+  try { best = parseInt(localStorage.getItem('neon-snake-best') || '0', 10) || 0; }
+  catch (e) { best = 0; }
+  bestEl.textContent = best;
+
+  function resetRun() {
+    snake = [{ x: 8, y: 10 }, { x: 7, y: 10 }, { x: 6, y: 10 }, { x: 5, y: 10 }];
+    dir = { x: 1, y: 0 }; nextDir = dir;
+    orbs = []; score = 0; lives = 3; level = 1; speedMs = 150;
+    particles = []; flash = 0;
+    for (let i = 0; i < 3; i++) spawnOrb();
+    updateHud();
+  }
+
+  function spawnOrb() {
+    for (let tries = 0; tries < 200; tries++) {
+      const p = { x: Math.floor(rand() * COLS), y: Math.floor(rand() * ROWS) };
+      const onSnake = snake.some(s => s.x === p.x && s.y === p.y);
+      const onOrb = orbs.some(o => o.x === p.x && o.y === p.y);
+      if (!onSnake && !onOrb) {
+        const kind = rand() < 0.16 ? 'bonus' : 'orb';
+        orbs.push({ ...p, kind, born: performance.now() });
+        return;
+      }
+    }
+  }
+
+  function updateHud() {
+    scoreEl.textContent = score;
+    bestEl.textContent = best;
+    livesEl.textContent = '♥'.repeat(Math.max(0, lives)) + '♡'.repeat(Math.max(0, 3 - lives));
+  }
+
+  function startGame() {
+    resetRun();
+    state = 'playing';
+    overlay.classList.add('hidden');
+    lastTick = performance.now(); acc = 0;
+    requestAnimationFrame(loop);
+  }
+
+  function gameOver() {
+    state = 'over';
+    if (score > best) {
+      best = score;
+      try { localStorage.setItem('neon-snake-best', String(best)); } catch (e) {}
+    }
+    updateHud();
+    ovTitle.textContent = 'GAME OVER';
+    ovText.innerHTML = `Score <b class="big">${score}</b> &nbsp;·&nbsp; Best ${best}<br>The snake got tangled. One prompt built this — go again?`;
+    ovBtn.textContent = '↻&nbsp; PLAY AGAIN';
+    overlay.classList.remove('hidden');
+  }
+
+  function loseLife(reason) {
+    lives -= 1; flash = 1; updateHud();
+    burst(snake[0].x, snake[0].y, '#ff4d6d');
+    if (lives <= 0) { gameOver(); return; }
+    // Short snake, back to the middle, brief breather.
+    const cx = Math.floor(COLS / 2), cy = Math.floor(ROWS / 2);
+    snake = [{ x: cx, y: cy }, { x: cx - 1, y: cy }, { x: cx - 2, y: cy }];
+    dir = { x: 1, y: 0 }; nextDir = dir;
+    state = 'playing';
+    ovTitle.textContent = 'OUCH!';
+    ovText.textContent = reason === 'wall' ? 'Into the wall! One life gone — keep going.' : 'Bit itself! One life gone — keep going.';
+    ovBtn.textContent = 'CONTINUE';
+    overlay.classList.remove('hidden');
+    state = 'paused';
+    // Demo autopilot resumes by itself so the recording never stalls.
+    if (DEMO) {
+      setTimeout(() => {
+        if (state !== 'paused') return;
+        overlay.classList.add('hidden');
+        state = 'playing';
+        lastTick = performance.now(); acc = 0;
+        requestAnimationFrame(loop);
+      }, 1200);
+    }
+  }
+
+  function burst(gx, gy, color) {
+    for (let i = 0; i < 26; i++) {
+      particles.push({
+        x: (gx + .5) * CELL, y: (gy + .5) * CELL,
+        vx: (rand() - .5) * 420, vy: (rand() - .5) * 420,
+        life: .5 + rand() * .5, max: 1, color, r: 2 + rand() * 3,
+      });
+    }
+  }
+
+  function step() {
+    dir = nextDir;
+    const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+    if (head.x < 0 || head.y < 0 || head.x >= COLS || head.y >= ROWS) { loseLife('wall'); return; }
+    const hitSelf = snake.some((s, i) => i > 0 && s.x === head.x && s.y === head.y);
+    if (hitSelf) { loseLife('self'); return; }
+    snake.unshift(head);
+    const oi = orbs.findIndex(o => o.x === head.x && o.y === head.y);
+    if (oi >= 0) {
+      const kind = orbs[oi].kind;
+      orbs.splice(oi, 1);
+      const pts = kind === 'bonus' ? 50 : 10;
+      score += pts; eatenAt = performance.now();
+      burst(head.x, head.y, kind === 'bonus' ? '#ffe14d' : '#00e5ff');
+      spawnOrb();
+      if (score > best) { best = score; try { localStorage.setItem('neon-snake-best', String(best)); } catch (e) {} }
+      const newLevel = 1 + Math.floor(score / 100);
+      if (newLevel !== level) { level = newLevel; speedMs = Math.max(70, 150 - (level - 1) * 12); }
+      updateHud();
+    } else {
+      snake.pop();
+    }
+  }
+
+  // Demo autopilot: steer at the nearest orb, never into a wall or the body,
+  // and never into a cell with no safe way out (one-move lookahead).
+  function demoSteer() {
+    if (!orbs.length) return;
+    const head = snake[0];
+    let target = orbs[0], bd = Infinity;
+    for (const o of orbs) {
+      const d = Math.abs(o.x - head.x) + Math.abs(o.y - head.y) - (o.kind === 'bonus' ? 2 : 0);
+      if (d < bd) { bd = d; target = o; }
+    }
+    const options = [
+      { x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 },
+    ].filter(d => !(d.x === -dir.x && d.y === -dir.y));
+    const blocked = (x, y, body) =>
+      x < 0 || y < 0 || x >= COLS || y >= ROWS ||
+      body.some((s, i) => i < body.length - 1 && s.x === x && s.y === y);
+    let bestMove = null, bestScore = Infinity;
+    for (const d of options) {
+      const nx = head.x + d.x, ny = head.y + d.y;
+      if (blocked(nx, ny, snake)) continue;
+      // The body after this move: head added, tail dropped unless eating.
+      const eating = orbs.some(o => o.x === nx && o.y === ny);
+      const nextBody = eating ? [{ x: nx, y: ny }, ...snake] : [{ x: nx, y: ny }, ...snake.slice(0, -1)];
+      // Is there a safe follow-up move from the new head?
+      const followUp = [
+        { x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 },
+      ].some(f => !(f.x === -d.x && f.y === -d.y) && !blocked(nx + f.x, ny + f.y, nextBody));
+      const dist = Math.abs(target.x - nx) + Math.abs(target.y - ny);
+      const crowded = snake.filter(s => Math.abs(s.x - nx) + Math.abs(s.y - ny) <= 2).length;
+      const s = dist * 10 + crowded * 3 + (followUp ? 0 : 1000);
+      if (s < bestScore) { bestScore = s; bestMove = d; }
+    }
+    if (bestMove) nextDir = bestMove;
+  }
+
+  function loop(now) {
+    if (state !== 'playing') return;
+    const dt = Math.min(100, now - lastTick);
+    lastTick = now; acc += dt;
+    if (DEMO) demoSteer();
+    while (acc >= speedMs) { acc -= speedMs; step(); if (state !== 'playing') return; }
+    draw(now);
+    requestAnimationFrame(loop);
+  }
+
+  function draw(now) {
+    const t = now / 1000;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Starfield background.
+    ctx.fillStyle = '#070718';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    for (let i = 0; i < 70; i++) {
+      const sx = (i * 137.5) % canvas.width, sy = (i * 89.3) % canvas.height;
+      const tw = .25 + .55 * Math.abs(Math.sin(t * .7 + i));
+      ctx.globalAlpha = tw * .8;
+      ctx.fillStyle = i % 5 === 0 ? '#ff9de2' : '#9fd8ff';
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+    // Grid.
+    ctx.strokeStyle = 'rgba(90,140,200,0.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= COLS; x++) { ctx.moveTo(x * CELL + .5, 0); ctx.lineTo(x * CELL + .5, canvas.height); }
+    for (let y = 0; y <= ROWS; y++) { ctx.moveTo(0, y * CELL + .5); ctx.lineTo(canvas.width, y * CELL + .5); }
+    ctx.stroke();
+    // Orbs.
+    for (const o of orbs) {
+      const cx = (o.x + .5) * CELL, cy = (o.y + .5) * CELL;
+      const pulse = 1 + .18 * Math.sin(t * 4 + o.x + o.y);
+      const r = (o.kind === 'bonus' ? 13 : 9) * pulse;
+      const col = o.kind === 'bonus' ? '#ffe14d' : '#00e5ff';
+      const grad = ctx.createRadialGradient(cx, cy, 1, cx, cy, r * 2.4);
+      grad.addColorStop(0, col); grad.addColorStop(.35, col + '55'); grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(cx, cy, r * 2.4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(cx, cy, r * .45, 0, Math.PI * 2); ctx.fill();
+    }
+    // Snake: glowing rounded body, bright head with eyes.
+    for (let i = snake.length - 1; i >= 0; i--) {
+      const s = snake[i];
+      const cx = (s.x + .5) * CELL, cy = (s.y + .5) * CELL;
+      const fade = 1 - (i / snake.length) * .55;
+      const hue = i === 0 ? '#b6ff5e' : (i % 2 ? '#37e08b' : '#19c37d');
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = hue;
+      ctx.shadowColor = hue; ctx.shadowBlur = i === 0 ? 22 : 12;
+      const rr = CELL / 2 - 2;
+      roundRect(cx - rr, cy - rr, rr * 2, rr * 2, 9);
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    // Eyes on the head, looking along the direction of travel.
+    const h = snake[0];
+    const hx = (h.x + .5) * CELL, hy = (h.y + .5) * CELL;
+    const ex = dir.x * 5, ey = dir.y * 5;
+    ctx.fillStyle = '#081018';
+    ctx.beginPath(); ctx.arc(hx - 6 + ex, hy - 6 + ey, 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(hx + 6 + ex, hy - 6 + ey, 3.4, 0, Math.PI * 2); ctx.fill();
+    // Particles.
+    particles = particles.filter(p => p.life > 0);
+    for (const p of particles) {
+      p.x += p.vx * .016; p.y += p.vy * .016; p.life -= .016;
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Level + speed note.
+    ctx.fillStyle = 'rgba(159,214,255,0.75)';
+    ctx.font = '700 15px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(`LEVEL ${level} · ${Math.round(1000 / speedMs)}/s`, canvas.width - 12, 22);
+    ctx.textAlign = 'left';
+    if (flash > 0) {
+      flash = Math.max(0, flash - .06);
+      ctx.fillStyle = `rgba(255,60,90,${flash * .28})`;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    if (DEMO) {
+      ctx.fillStyle = 'rgba(255,225,77,0.9)';
+      ctx.font = '700 15px "Segoe UI", system-ui, sans-serif';
+      ctx.fillText('▶ DEMO — the agent is playing its own game', 12, 22);
+    }
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  const KEYS = {
+    ArrowUp: { x: 0, y: -1 }, KeyW: { x: 0, y: -1 },
+    ArrowDown: { x: 0, y: 1 }, KeyS: { x: 0, y: 1 },
+    ArrowLeft: { x: -1, y: 0 }, KeyA: { x: -1, y: 0 },
+    ArrowRight: { x: 1, y: 0 }, KeyD: { x: 1, y: 0 },
+  };
+  addEventListener('keydown', (e) => {
+    if (KEYS[e.code]) {
+      e.preventDefault();
+      const d = KEYS[e.code];
+      if (!(d.x === -dir.x && d.y === -dir.y)) nextDir = d;
+      if (state === 'menu') startGame();
+      return;
+    }
+    if (e.code === 'KeyR' && (state === 'over' || state === 'playing' || state === 'paused')) startGame();
+    if (e.code === 'KeyP' && state === 'playing') {
+      state = 'paused';
+      ovTitle.textContent = 'PAUSED';
+      ovText.textContent = 'Take a breath. The snake waits.';
+      ovBtn.textContent = '▶&nbsp; RESUME';
+      overlay.classList.remove('hidden');
+    }
+    if (e.code === 'Enter' && state === 'menu') startGame();
+  });
+  let touchStart = null;
+  canvas.addEventListener('touchstart', (e) => { touchStart = e.touches[0]; }, { passive: true });
+  canvas.addEventListener('touchend', (e) => {
+    if (!touchStart) return;
+    const dx = e.changedTouches[0].clientX - touchStart.clientX;
+    const dy = e.changedTouches[0].clientY - touchStart.clientY;
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < 24) { if (state === 'menu') startGame(); return; }
+    const d = Math.abs(dx) > Math.abs(dy) ? { x: Math.sign(dx), y: 0 } : { x: 0, y: Math.sign(dy) };
+    if (!(d.x === -dir.x && d.y === -dir.y)) nextDir = d;
+    touchStart = null;
+  }, { passive: true });
+  canvas.addEventListener('click', () => { if (state === 'menu') startGame(); });
+  ovBtn.addEventListener('click', () => {
+    if (state === 'paused' && lives > 0 && lives < 3) {
+      state = 'playing';
+      overlay.classList.add('hidden');
+      lastTick = performance.now(); acc = 0;
+      requestAnimationFrame(loop);
+    } else {
+      startGame();
+    }
+  });
+
+  resetRun();
+  if (DEMO) {
+    state = 'playing';
+    overlay.classList.add('hidden');
+    lastTick = performance.now(); acc = 0;
+    requestAnimationFrame(loop);
+  } else {
+    draw(performance.now());
+  }
+})();
+</script>
+</body>
+</html>
